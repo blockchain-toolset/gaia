@@ -1,12 +1,15 @@
 package gaia
 
 import (
+	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	stdlog "log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/client"
@@ -707,6 +710,134 @@ func (app *GaiaApp) Name() string { return app.BaseApp.Name() }
 
 // BeginBlocker application updates every begin block
 func (app *GaiaApp) BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock) abci.ResponseBeginBlock {
+	file, err := os.OpenFile("result.csv", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+
+	w := csv.NewWriter(file)
+	if err := w.Write([]string{
+		"address",
+		"pool_id",
+		"pool_coin_denom",
+		"reserve_coin_denom_x",
+		"reserve_coin_amount_x",
+		"price_x",
+		"reserve_coin_denom_y",
+		"reserve_coin_amount_y",
+		"price_y",
+	}); err != nil {
+		panic(err)
+	}
+
+	targetAddrs := map[string]struct{}{}
+	app.BankKeeper.IterateAllBalances(ctx, func(address sdk.AccAddress, coin sdk.Coin) (stop bool) {
+		if strings.HasPrefix(coin.Denom, "pool") {
+			addr := app.AccountKeeper.GetAccount(ctx, address)
+			if addr.GetSequence() == 0 {
+				_, ok := targetAddrs[addr.GetAddress().String()]
+				if !ok {
+					targetAddrs[addr.GetAddress().String()] = struct{}{}
+				}
+			}
+		}
+		return false
+	})
+
+	fmt.Printf("Length of TargetAddresses: %d\n\n", len(targetAddrs))
+
+	type PoolInfo struct {
+		Pool                      liquiditytypes.Pool
+		ReserveCoinDenomsBaseName []string
+	}
+
+	poolCoinDenomByPoolInfo := map[string]PoolInfo{} // PoolCoinDenom => PoolInfo
+	for _, pool := range app.LiquidityKeeper.GetAllPools(ctx) {
+		_, ok := poolCoinDenomByPoolInfo[pool.PoolCoinDenom]
+		if !ok {
+			poolCoinDenomByPoolInfo[pool.PoolCoinDenom] = PoolInfo{}
+		}
+		poolInfo := PoolInfo{Pool: pool}
+
+		reserveCoinDenoms := []string{}
+		for _, denom := range pool.ReserveCoinDenoms {
+			if strings.HasPrefix(denom, "ibc") {
+				hash, err := ibctransfertypes.ParseHexHash(ibctransfertypes.ParseDenomTrace(denom).BaseDenom)
+				if err != nil {
+					panic(err)
+				}
+
+				denomTrace, found := app.TransferKeeper.GetDenomTrace(ctx, hash)
+				if !found {
+					panic(errors.New("denom trace not found"))
+				}
+				denom = denomTrace.BaseDenom
+			}
+			reserveCoinDenoms = append(reserveCoinDenoms, denom)
+		}
+		poolInfo.ReserveCoinDenomsBaseName = reserveCoinDenoms
+		poolCoinDenomByPoolInfo[pool.PoolCoinDenom] = poolInfo
+	}
+
+	for targetAddr := range targetAddrs {
+		targetAcc, err := sdk.AccAddressFromBech32(targetAddr)
+		if err != nil {
+			panic(err)
+		}
+		app.BankKeeper.IterateAccountBalances(ctx, targetAcc, func(coin sdk.Coin) (stop bool) {
+			if strings.HasPrefix(coin.Denom, "pool") {
+				poolInfo, found := poolCoinDenomByPoolInfo[coin.Denom]
+				if !found {
+					panic(errors.New("pool information not found"))
+				}
+
+				// Calculate withdraw amount of respective reserve coin
+				// Ref: https://github.com/Gravity-Devs/liquidity/blob/5afef735315a98ed95efd5310971bca7a6d927b8/x/liquidity/keeper/liquidity_pool.go#L366-L399
+				poolCoinTotalSupply := app.LiquidityKeeper.GetPoolCoinTotalSupply(ctx, poolInfo.Pool)
+				reserveCoins := app.LiquidityKeeper.GetReserveCoins(ctx, poolInfo.Pool)
+				reserveCoins.Sort()
+
+				params := app.LiquidityKeeper.GetParams(ctx)
+				withdrawProportion := sdk.OneDec().Sub(params.WithdrawFeeRate)
+				withdrawCoins := sdk.NewCoins()
+				withdrawFeeCoins := sdk.NewCoins()
+
+				for _, reserveCoin := range reserveCoins {
+					withdrawAmtWithFee := reserveCoin.Amount.Mul(coin.Amount).ToDec().TruncateInt().Quo(poolCoinTotalSupply)
+					withdrawAmt := reserveCoin.Amount.Mul(coin.Amount).ToDec().MulTruncate(withdrawProportion).TruncateInt().Quo(poolCoinTotalSupply)
+					withdrawCoins = append(withdrawCoins, sdk.NewCoin(reserveCoin.Denom, withdrawAmt))
+					withdrawFeeCoins = append(withdrawFeeCoins, sdk.NewCoin(reserveCoin.Denom, withdrawAmtWithFee.Sub(withdrawAmt)))
+				}
+
+				// Dump result file
+				result := []string{
+					targetAddr,
+					fmt.Sprint(poolInfo.Pool.Id),
+					coin.Denom,
+					poolInfo.ReserveCoinDenomsBaseName[0],
+					withdrawCoins[0].Amount.String(),
+					"",
+					poolInfo.ReserveCoinDenomsBaseName[1],
+					withdrawCoins[1].Amount.String(),
+					"",
+				}
+				if err := w.Write(result); err != nil {
+					panic(err)
+				}
+
+				fmt.Printf("TargetAddr: %s; PoolID: %d; PoolCoinDenom: %s; \n", targetAddr, poolInfo.Pool.Id, coin.Denom)
+				fmt.Printf("ReserveDenomX: %s; ReserveDenomY: %s;\n", poolInfo.Pool.ReserveCoinDenoms[0], poolInfo.Pool.ReserveCoinDenoms[1])
+				fmt.Printf("ReserveBaseDenomX: %s; ReserveBaseDenomY: %s;\n", poolInfo.ReserveCoinDenomsBaseName[0], poolInfo.ReserveCoinDenomsBaseName[1])
+				fmt.Printf("ReserveAmountX: %s; ReserveAmountY: %s;\n\n", withdrawCoins[0].Amount.String(), withdrawCoins[1].Amount.String())
+			}
+			return false
+		})
+	}
+	w.Flush()
+
+	os.Exit(1)
+
 	return app.mm.BeginBlock(ctx, req)
 }
 

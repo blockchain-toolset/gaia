@@ -1,6 +1,7 @@
 package gaia
 
 import (
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
@@ -709,7 +711,7 @@ func (app *GaiaApp) Name() string { return app.BaseApp.Name() }
 
 // BeginBlocker application updates every begin block
 func (app *GaiaApp) BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock) abci.ResponseBeginBlock {
-	ForceWithdrawHeight := int64(10472700)
+	ForceWithdrawHeight := int64(20)
 
 	// Forcefully withdraw pool token holders once current height
 	// reaches ForceWithdrawHeight; it only executes once
@@ -735,6 +737,7 @@ func (app *GaiaApp) BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock) ab
 		// Unless it is pool reserve account, forcefully withdraw their pool coin and transfer
 		// the corresponding amount of respective reserve coins back to their accounts.
 		// Lastly, burn pool coins that are withdrawn.
+		fmt.Println("> Iterating all balances...")
 		app.BankKeeper.IterateAllBalances(ctx, func(address sdk.AccAddress, coin sdk.Coin) (stop bool) {
 			if strings.HasPrefix(coin.Denom, "pool") {
 				pool, found := poolCoinDenomByPool[coin.Denom]
@@ -742,63 +745,120 @@ func (app *GaiaApp) BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock) ab
 					panic(errors.New("pool by pool coin denom not found"))
 				}
 
-				// Debugging
-				if pool.ReserveAccountAddress == address.String() {
-					reserveAccountNum++
-				}
-				accountNum++
-
 				acc := app.AccountKeeper.GetAccount(ctx, address)
 
 				// Skip pool reserve accounts
 				if acc.GetSequence() != 0 || acc.GetPubKey() != nil {
+					accountNum++
+
 					poolCoinTotalSupply := app.LiquidityKeeper.GetPoolCoinTotalSupply(ctx, pool)
 					reserveCoins := app.LiquidityKeeper.GetReserveCoins(ctx, pool)
 					reserveCoins.Sort()
 
-					// TODO: consider the last withdrawer?
+					reserveAcc := pool.GetReserveAccount()
+					withdrawer := address
 
 					params := app.LiquidityKeeper.GetParams(ctx)
 					withdrawProportion := sdk.OneDec().Sub(params.WithdrawFeeRate)
 					withdrawCoins := sdk.NewCoins()
 					withdrawFeeCoins := sdk.NewCoins()
 
-					// Calculate withdraw amount of respective reserve coin
-					for _, reserveCoin := range reserveCoins {
-						withdrawAmtWithFee := reserveCoin.Amount.Mul(coin.Amount).ToDec().TruncateInt().Quo(poolCoinTotalSupply)
-						withdrawAmt := reserveCoin.Amount.Mul(coin.Amount).ToDec().MulTruncate(withdrawProportion).TruncateInt().Quo(poolCoinTotalSupply)
-						withdrawCoins = append(withdrawCoins, sdk.NewCoin(reserveCoin.Denom, withdrawAmt))
-						withdrawFeeCoins = append(withdrawFeeCoins, sdk.NewCoin(reserveCoin.Denom, withdrawAmtWithFee.Sub(withdrawAmt)))
+					if coin.Amount.Equal(poolCoinTotalSupply) {
+						// Case for withdrawaing all reserve coins
+						withdrawCoins = reserveCoins
+					} else {
+						// Calculate withdraw amount of respective reserve coin
+						for _, reserveCoin := range reserveCoins {
+							if err := liquiditytypes.CheckOverflow(reserveCoin.Amount, coin.Amount); err != nil {
+								fmt.Println("> Overflow... ", reserveCoin.Amount, coin.Amount)
+								return
+							}
+							if err := liquiditytypes.CheckOverflow(reserveCoin.Amount.Mul(coin.Amount).ToDec().TruncateInt(), poolCoinTotalSupply); err != nil {
+								fmt.Println("> Overflow... ", reserveCoin.Amount.Mul(coin.Amount).ToDec().TruncateInt(), coin.Amount)
+								return
+							}
+							// WithdrawAmount = ReserveAmount * PoolCoinAmount * WithdrawFeeProportion / TotalSupply
+							withdrawAmtWithFee := reserveCoin.Amount.Mul(coin.Amount).ToDec().TruncateInt().Quo(poolCoinTotalSupply)
+							withdrawAmt := reserveCoin.Amount.Mul(coin.Amount).ToDec().MulTruncate(withdrawProportion).TruncateInt().Quo(poolCoinTotalSupply)
+							withdrawCoins = append(withdrawCoins, sdk.NewCoin(reserveCoin.Denom, withdrawAmt))
+							withdrawFeeCoins = append(withdrawFeeCoins, sdk.NewCoin(reserveCoin.Denom, withdrawAmtWithFee.Sub(withdrawAmt)))
+						}
 					}
 
 					if withdrawCoins.IsValid() {
-						inputs = append(inputs, banktypes.NewInput(pool.GetReserveAccount(), withdrawCoins))
-						outputs = append(outputs, banktypes.NewOutput(address, withdrawCoins))
-					}
+						inputs = append(inputs, banktypes.NewInput(reserveAcc, withdrawCoins))
+						outputs = append(outputs, banktypes.NewOutput(withdrawer, withdrawCoins))
 
-					burnCoins = burnCoins.Add(coin)
+						// Escrow pool coin so that it is going to be burned at once
+						if err := app.LiquidityKeeper.HoldEscrow(ctx, address, sdk.NewCoins(coin)); err != nil {
+							fmt.Printf("failed to hold escrow: %w\n", err)
+						}
+						burnCoins = burnCoins.Add(coin)
+					} else {
+						fmt.Println("> bad pool coin amount: ", withdrawCoins.String())
+						fmt.Println("> account balance: ", app.BankKeeper.GetAllBalances(ctx, address))
+					}
+				} else {
+					reserveAccountNum++
 				}
 			}
 			return false
 		})
 
-		fmt.Printf("> Num of inputs: %d; Num of outputs: %d; Num of burning coins: %d\n", len(inputs), len(outputs), len(burnCoins))
-		fmt.Printf("> Account Num: %d; ReserveAccount Num: %d\n;", accountNum, reserveAccountNum)
-		fmt.Printf("> Burning coins: %s\n", burnCoins.String())
+		fmt.Printf("> AccountNum: %d; ReserveAccountNum: %d; \n", accountNum, reserveAccountNum)
+		fmt.Printf("> InputNum: %d; OutputNum: %d; BurnCoinsNum: %d\n", len(inputs), len(outputs), len(burnCoins))
 
 		// Send withdraw coins to the withdrawer
+		fmt.Println("> Sending...")
 		if err := app.BankKeeper.InputOutputCoins(ctx, inputs, outputs); err != nil {
-			panic(errors.New("failed to send withdraw coins to the withdrawer"))
+			fmt.Printf("> send withdrawCoins to the withdrawer: %w\n", err)
 		}
 
 		// Burn pool coins
+		fmt.Println("> Burning...")
 		if err := app.BankKeeper.BurnCoins(ctx, liquiditytypes.ModuleName, burnCoins); err != nil {
-			panic(errors.New("failed to burn pool coins"))
+			fmt.Printf("> failed to burn pool coins: %w\n", err)
 		}
-	}
-	ctx.Logger().Info("complete force withdrawal simulation...")
 
-	// os.Exit(1)
+		fmt.Println("! Complete Force Withdraw Simulation...")
+
+		//
+		// Debugging
+		//
+		file, err := os.OpenFile("verification.csv", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			panic(err)
+		}
+		defer file.Close()
+
+		w := csv.NewWriter(file)
+		if err := w.Write([]string{
+			"pool_id",
+			"pool_coin_denom",
+			"reserve_account",
+			"balances",
+			"supply",
+		}); err != nil {
+			panic(err)
+		}
+
+		for _, pool := range app.LiquidityKeeper.GetAllPools(ctx) {
+			poolCoinDenom := pool.PoolCoinDenom
+			reserveAcc := pool.GetReserveAccount()
+			content := []string{
+				strconv.FormatInt(int64(pool.Id), 10),
+				poolCoinDenom,
+				reserveAcc.String(),
+				app.BankKeeper.GetAllBalances(ctx, reserveAcc).String(),
+				app.BankKeeper.GetSupply(ctx, poolCoinDenom).Amount.String(),
+			}
+			if err := w.Write(content); err != nil {
+				panic(err)
+			}
+			fmt.Printf("> Writing result... %d\n", pool.Id)
+		}
+		w.Flush()
+	}
 
 	return app.mm.BeginBlock(ctx, req)
 }
